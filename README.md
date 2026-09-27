@@ -64,6 +64,12 @@
   名称唯一的环境（各自带 `marker_env`），对每个环境**独立**解析同一组根需求与
   传递依赖（PEP 508 标记按各环境求值，一个环境触顶或冲突不影响其他环境），并仅
   对成功环境汇总版本矩阵——区分“缺席”与具体版本，列出版本或存在性不同的包。
+- **版本撤回分析**：`POST /analyze/version-withdrawal` 沿用 `/resolve` 的包清单、
+  根需求、锁与解析选项，另指定一个要撤回的包版本；先对原清单求解基线，再**仅从
+  本次请求的清单**移除该版本重新求解。撤回后的求解是对完整依赖约束的**整体重算**
+  （不沿旧依赖图推断），两次都成功时列出新增、消失与版本改变的包，并返回撤回后的
+  依赖图与锁处置；基线冲突、撤回后冲突与任一次搜索触顶分别给出明确状态，触顶不
+  视为无解。
 
 ## 一条命令启动
 
@@ -84,6 +90,7 @@ docker compose up --build
 - `POST /audit/graph-fingerprints` — 为 `<root>` 与每个包的完整依赖闭包计算 SHA-256 指纹
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
 - `POST /analyze/environment-matrix` — 在多个标记环境下独立解析并汇总版本矩阵
+- `POST /analyze/version-withdrawal` — 撤回一个包版本后整体重算并对比解析结果
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -741,6 +748,90 @@ curl -s -X POST localhost:8000/analyze/environment-matrix \
 - 环境数量不在 2～8、缺 `name`、名字为空或含多余字段时返回 `422`；
 - 环境名重复时返回 `400`（`invalid_request`）。
 
+## 版本撤回分析 API
+
+`POST /analyze/version-withdrawal` 接收与 `/resolve` **完全相同的请求字段**
+（`packages`、`root`、`locks`、`allow_prereleases`、`marker_env`、`max_attempts`，
+校验规则完全一致），外加一个 `withdraw` 目标（要撤回的包名与版本），回答：
+**如果该版本从包清单中消失，解析结果会怎样变化？**
+
+- 先在**未修改的清单**上求解基线；再把**本次请求的清单**复制一份、仅移除
+  `withdraw` 指定的那个版本（其余版本、根需求、锁、标记环境与 `max_attempts`
+  预算全部不变），重新求解。
+- 撤回后的求解是对**完整依赖约束的整体重算**——由求解器从头回溯，而不是沿
+  旧依赖图推断——因此撤回引发的回退版本、新引入或被丢弃的传递依赖都会被
+  重新计算。
+- 包名与版本按清单自身规则规范化（`Foo_Bar` 与 `foo-bar`、`1.0` 与 `1.0.0`
+  视为同一条目）；`withdraw` 的包或版本在清单中不存在时返回 `400`。
+- 即使撤回的是某包的最后一个版本，该包仍留在清单中（版本列表为空），求解器
+  会将其报告为“无可用版本”而非“包不存在”。
+
+```bash
+curl -s -X POST localhost:8000/analyze/version-withdrawal \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {"1.0": {"dependencies": {"web": ""}}},
+    "web": {"3.0": {"dependencies": {"common": ">=2.0"}},
+            "2.0": {"dependencies": {"common": "<2.0", "extra": ""}}},
+    "common": {"1.5": {}, "2.0": {}},
+    "extra": {"1.0": {}}
+  },
+  "root": {"app": ""},
+  "withdraw": {"package": "web", "version": "3.0"}
+}'
+```
+
+响应（两次求解都成功，HTTP 200）：
+
+```json
+{
+  "status": "ok",
+  "attempts": 7,
+  "allow_prereleases": false,
+  "withdraw": {"package": "web", "version": "3.0"},
+  "changes": {
+    "added": [{"package": "extra", "version": "1.0"}],
+    "removed": [],
+    "changed": [
+      {"package": "common", "from": "2.0", "to": "1.5"},
+      {"package": "web", "from": "3.0", "to": "2.0"}
+    ]
+  },
+  "baseline_resolved": {"app": "1.0", "common": "2.0", "web": "3.0"},
+  "resolved": {"app": "1.0", "common": "1.5", "extra": "1.0", "web": "2.0"},
+  "dependency_graph": [ ... ],
+  "locks": {}
+}
+```
+
+响应字段（`status: "ok"` 时）：
+
+- `withdraw`：实际撤回的规范化包名与版本（回显）。
+- `changes`：两次成功结果的对比——`added`（撤回后新出现的包）、`removed`
+  （消失的包）、`changed`（版本改变的包，含 `from` / `to`），均按规范包名
+  稳定排序。
+- `baseline_resolved`：基线解（包名 → 版本）。
+- `resolved` / `dependency_graph` / `locks`：**撤回后**的解、依赖图与每个锁的
+  处置（与 `/resolve` 成功响应同形态；锁定版本恰好被撤回时会报告为
+  `missing-version`）。
+- `attempts`：两次求解实际求值的候选次数之和。
+
+其他响应形态（HTTP 状态码均为 **200**，由 `status` 区分）：
+
+- **基线冲突**：`status: "baseline_conflict"`，带基线求解的 `locks` 与结构化
+  `conflict`（与 `/resolve` 冲突响应同形态）；没有基线解，不做任何对比。
+- **撤回后冲突**：`status: "withdrawn_conflict"`，带 `baseline_resolved` 以及
+  撤回后求解的 `locks` 与结构化 `conflict`。
+- **未确定**：任一次求解触及 `max_attempts` 时返回 `status: "undetermined"`
+  与 `error.code = "search_limit_exceeded"`，`message` 指明是基线求解还是撤回后
+  求解触顶；触顶**不视为无解**，因此不会报告 `changes` 或 `conflict`。
+
+结果顺序稳定：相同输入永远得到相同的 `changes`、`attempts` 与依赖图。校验规则
+（违反即返回 `400/422`，错误体与 `/resolve` 相同）：`packages` / `root` /
+`locks` 的校验与 `/resolve` 完全一致；`withdraw` 缺字段、含多余字段、包名或
+版本为空返回 `422`，包或版本在清单中不存在（或版本不是合法 PEP 440）返回
+`400`。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -756,7 +847,9 @@ curl -s -X POST localhost:8000/analyze/environment-matrix \
 
 `/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体
 （`/analyze/environment-matrix` 在此基础上把顶层 `marker_env` 换成 2～8 个各自
-携带 `marker_env` 的 `environments`，其余字段一致）：
+携带 `marker_env` 的 `environments`，其余字段一致；`/analyze/version-withdrawal`
+则在与 `/resolve` 完全相同的字段之外增加一个 `withdraw: {"package", "version"}`
+目标）：
 
 ```json
 {
@@ -904,14 +997,15 @@ app/
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
   environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
+  version_withdrawal.py # 版本撤回分析：基线求解、移除单版本后整体重算、新增/消失/变更对比
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   graph_fingerprints.py # 闭包指纹：可达闭包的确定性序列化与 SHA-256、不可达包单列
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、闭包指纹、重建计划与环境矩阵）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/analyze/version-withdrawal、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、闭包指纹、重建计划、环境矩阵与版本撤回分析）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
