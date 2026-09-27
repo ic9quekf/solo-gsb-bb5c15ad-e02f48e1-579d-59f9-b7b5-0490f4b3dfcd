@@ -33,6 +33,7 @@ from .resolver import (
     resolve,
 )
 from .serialize import conflict_summary
+from .version_withdrawal import run_version_withdrawal
 
 DEFAULT_DB_PATH = os.path.join("data", "jobs.db")
 
@@ -94,6 +95,20 @@ class EnvironmentMatrixRequest(ResolveBaseRequest):
         description=(
             "Named marker environments to resolve under, in comparison "
             "order. Each environment is solved independently."
+        ),
+    )
+
+
+class VersionWithdrawalRequest(ResolveRequest):
+    withdraw_package: str = Field(
+        ..., min_length=1,
+        description="Name of the package whose version is withdrawn.",
+    )
+    withdraw_version: str = Field(
+        ..., min_length=1,
+        description=(
+            "PEP 440 version withdrawn from this request's package list. "
+            "The package/version pair must exist in 'packages'."
         ),
     )
 
@@ -229,7 +244,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -486,6 +501,44 @@ async def environment_matrix_endpoint(payload: EnvironmentMatrixRequest) -> JSON
         allow_prereleases=payload.allow_prereleases,
         max_attempts=payload.max_attempts,
         environments=environments,
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/analyze/version-withdrawal")
+async def version_withdrawal_endpoint(
+    payload: VersionWithdrawalRequest,
+) -> JSONResponse:
+    """Analyze the impact of withdrawing one package version.
+
+    Accepts the exact same request fields as ``/resolve`` (package list,
+    root requirements, locks, pre-release and marker options, attempt
+    budget) plus ``withdraw_package`` / ``withdraw_version``.  The
+    unmodified input is solved first as a baseline; only the named
+    version is then removed from this request's package list and the
+    result is re-solved from scratch under the full dependency
+    constraints, so withdrawal-induced backtracking is never inferred
+    from the old graph.  When both solves succeed, the added, disappeared
+    and version-changed packages are listed alongside the post-withdrawal
+    dependency graph and lock disposition.
+
+    Outcomes return 200 and are discriminated by ``status``: ``ok``,
+    ``baseline-conflict`` / ``withdrawal-conflict`` (structured conflict
+    body on the failing solve), or ``baseline-limit`` /
+    ``withdrawal-limit`` (that solve hit ``max_attempts``; the search
+    limit is never treated as no-solution).  An unknown package or
+    version is a 400 input error.
+    """
+    index, entries, locks = _parse_input(payload)
+    body = run_version_withdrawal(
+        index,
+        entries,
+        locks,
+        allow_prereleases=payload.allow_prereleases,
+        marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+        withdraw_package=payload.withdraw_package,
+        withdraw_version=payload.withdraw_version,
     )
     return JSONResponse(status_code=200, content=body)
 
